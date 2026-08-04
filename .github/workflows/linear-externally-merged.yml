@@ -76,8 +76,9 @@ jobs:
           fi
 
           while read -r n; do
-            merged=$(gh pr view "$n" --json merged --jq .merged)
-            if [[ "$merged" == "true" ]]; then
+            state=$(gh pr view "$n" --json state,mergedAt --jq '[.state, (.mergedAt // "")] | @tsv')
+            pr_state=${state%%$'	'*}
+            if [[ "$pr_state" == "MERGED" ]]; then
               echo "Skipping #${n} (already merged in GitHub)"
               continue
             fi
