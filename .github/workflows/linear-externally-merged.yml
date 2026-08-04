@@ -1,7 +1,7 @@
 name: linear-externally-merged
 
-# Commit this file to the Graphite MQ trunk (Clay: merge-queue-testing / dev).
-# push workflows run from the branch being updated, not from the repo default.
+# Put this workflow ON the Graphite MQ trunk branch (Clay: merge-queue-testing).
+# `push` workflows run from the commit being pushed, not from the default branch.
 on:
   push:
     branches:
@@ -35,8 +35,9 @@ jobs:
 
           emit_from_pr() {
             local num="$1" title="$2" head="$3" merged="$4" base="$5" body="$6"
+            local re='\(PRs[[:space:]]*([^)]+)\)'
             if is_mq_draft "$title" "$head"; then
-              if [[ "$title" =~ \(PRs[[:space:]]*([^)]+)\) ]]; then
+              if [[ "$title" =~ $re ]]; then
                 echo "${BASH_REMATCH[1]}" | tr ',' '\n' | tr -d ' '
               fi
               grep -oE '#[0-9]+' <<<"$body" | tr -d '#' || true
@@ -75,6 +76,11 @@ jobs:
           fi
 
           while read -r n; do
+            merged=$(gh pr view "$n" --json merged --jq .merged)
+            if [[ "$merged" == "true" ]]; then
+              echo "Skipping #${n} (already merged in GitHub)"
+              continue
+            fi
             echo "Adding ${LABEL} to #${n}"
             gh pr edit "$n" --add-label "$LABEL"
           done < /tmp/to-label.txt
