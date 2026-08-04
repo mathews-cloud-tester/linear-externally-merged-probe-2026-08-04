@@ -1,0 +1,80 @@
+name: linear-externally-merged
+
+# Commit this file to the Graphite MQ trunk (Clay: merge-queue-testing / dev).
+# push workflows run from the branch being updated, not from the repo default.
+on:
+  push:
+    branches:
+      - testing
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  label-source-prs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Label Graphite-landed source PRs externally-merged
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TRUNK_SHA: ${{ github.sha }}
+          TRUNK_REF: ${{ github.ref_name }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          LABEL=externally-merged
+          gh label create "$LABEL" --color 0E8A16 --description "Linear custom merge queue marker" 2>/dev/null || true
+
+          is_mq_draft() {
+            local title="$1" head="$2"
+            [[ "$title" == "[Graphite MQ]"* || "$head" == gtmq_* ]]
+          }
+
+          emit_from_pr() {
+            local num="$1" title="$2" head="$3" merged="$4" base="$5" body="$6"
+            if is_mq_draft "$title" "$head"; then
+              if [[ "$title" =~ \(PRs[[:space:]]*([^)]+)\) ]]; then
+                echo "${BASH_REMATCH[1]}" | tr ',' '\n' | tr -d ' '
+              fi
+              grep -oE '#[0-9]+' <<<"$body" | tr -d '#' || true
+              return 0
+            fi
+            if [[ "$merged" == "false" && "$base" == "$TRUNK_REF" ]]; then
+              echo "$num"
+            fi
+          }
+
+          {
+            gh api --paginate "repos/${GH_REPO}/commits/${TRUNK_SHA}/pulls" \
+              -H "Accept: application/vnd.github.groot-preview+json" \
+              --jq '.[] | [.number, .title, .head.ref, (.merged|tostring), .base.ref, (.body // "" | gsub("\t";" ") | gsub("\n";" "))] | @tsv' \
+              | while IFS=$'\t' read -r num title head merged base body; do
+                  emit_from_pr "$num" "$title" "$head" "$merged" "$base" "$body"
+                done
+
+            if [[ "$BEFORE_SHA" != 0000000000000000000000000000000000000000 ]]; then
+              gh api "repos/${GH_REPO}/compare/${BEFORE_SHA}...${TRUNK_SHA}" --jq '.commits[].sha' \
+                | while read -r sha; do
+                    [ -n "$sha" ] || continue
+                    gh api "repos/${GH_REPO}/commits/${sha}/pulls" \
+                      -H "Accept: application/vnd.github.groot-preview+json" \
+                      --jq '.[] | [.number, .title, .head.ref, (.merged|tostring), .base.ref, (.body // "" | gsub("\t";" ") | gsub("\n";" "))] | @tsv' \
+                      | while IFS=$'\t' read -r num title head merged base body; do
+                          emit_from_pr "$num" "$title" "$head" "$merged" "$base" "$body"
+                        done
+                  done
+            fi
+          } | awk 'NF && $0 ~ /^[0-9]+$/ && !seen[$0]++' | tee /tmp/to-label.txt
+
+          if [ ! -s /tmp/to-label.txt ]; then
+            echo "No source PRs found for this trunk push"
+            exit 0
+          fi
+
+          while read -r n; do
+            echo "Adding ${LABEL} to #${n}"
+            gh pr edit "$n" --add-label "$LABEL"
+          done < /tmp/to-label.txt
