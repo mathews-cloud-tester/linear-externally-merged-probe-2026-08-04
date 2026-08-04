@@ -1,7 +1,7 @@
 name: linear-externally-merged
 
-# Put this workflow ON the Graphite MQ trunk branch (Clay: merge-queue-testing).
-# `push` workflows run from the commit being pushed, not from the default branch.
+# MUST live on the Graphite MQ trunk (Clay: merge-queue-testing / whatever
+# Graphite is configured to merge into). `push` workflows run from that branch.
 on:
   push:
     branches:
@@ -22,66 +22,52 @@ jobs:
           GH_REPO: ${{ github.repository }}
           TRUNK_SHA: ${{ github.sha }}
           TRUNK_REF: ${{ github.ref_name }}
-          BEFORE_SHA: ${{ github.event.before }}
         run: |
           set -euo pipefail
           LABEL=externally-merged
           gh label create "$LABEL" --color 0E8A16 --description "Linear custom merge queue marker" 2>/dev/null || true
 
-          is_mq_draft() {
-            local title="$1" head="$2"
-            [[ "$title" == "[Graphite MQ]"* || "$head" == gtmq_* ]]
-          }
+          # Graphite FF sets trunk == [Graphite MQ] draft head, then closes source PRs.
+          # At push time the draft is already closed and source PRs are usually still open.
+          drafts=$(gh pr list --repo "$GH_REPO" --state closed --base "$TRUNK_REF" --limit 50 \
+            --json number,title,headRefOid,headRefName,body)
 
-          emit_from_pr() {
-            local num="$1" title="$2" head="$3" merged="$4" base="$5" body="$6"
-            local re='\(PRs[[:space:]]*([^)]+)\)'
-            if is_mq_draft "$title" "$head"; then
+          nums=$(jq -r --arg sha "$TRUNK_SHA" '
+              .[]
+              | select((.title | startswith("[Graphite MQ]")) or (.headRefName | startswith("gtmq_")))
+              | select(.headRefOid == $sha)
+              | [.title, (.body // "")] | @tsv
+            ' <<<"$drafts")
+
+          if [[ -z "${nums}" ]]; then
+            echo "No closed Graphite MQ draft with head $TRUNK_SHA on $TRUNK_REF"
+            exit 0
+          fi
+
+          echo "Matched MQ draft metadata:"
+          echo "$nums"
+
+          {
+            while IFS=$'\t' read -r title body; do
+              re='\(PRs[[:space:]]*([^)]+)\)'
               if [[ "$title" =~ $re ]]; then
                 echo "${BASH_REMATCH[1]}" | tr ',' '\n' | tr -d ' '
               fi
               grep -oE '#[0-9]+' <<<"$body" | tr -d '#' || true
-              return 0
-            fi
-            if [[ "$merged" == "false" && "$base" == "$TRUNK_REF" ]]; then
-              echo "$num"
-            fi
-          }
-
-          {
-            gh api --paginate "repos/${GH_REPO}/commits/${TRUNK_SHA}/pulls" \
-              -H "Accept: application/vnd.github.groot-preview+json" \
-              --jq '.[] | [.number, .title, .head.ref, (.merged|tostring), .base.ref, (.body // "" | gsub("\t";" ") | gsub("\n";" "))] | @tsv' \
-              | while IFS=$'\t' read -r num title head merged base body; do
-                  emit_from_pr "$num" "$title" "$head" "$merged" "$base" "$body"
-                done
-
-            if [[ "$BEFORE_SHA" != 0000000000000000000000000000000000000000 ]]; then
-              gh api "repos/${GH_REPO}/compare/${BEFORE_SHA}...${TRUNK_SHA}" --jq '.commits[].sha' \
-                | while read -r sha; do
-                    [ -n "$sha" ] || continue
-                    gh api "repos/${GH_REPO}/commits/${sha}/pulls" \
-                      -H "Accept: application/vnd.github.groot-preview+json" \
-                      --jq '.[] | [.number, .title, .head.ref, (.merged|tostring), .base.ref, (.body // "" | gsub("\t";" ") | gsub("\n";" "))] | @tsv' \
-                      | while IFS=$'\t' read -r num title head merged base body; do
-                          emit_from_pr "$num" "$title" "$head" "$merged" "$base" "$body"
-                        done
-                  done
-            fi
+            done <<<"$nums"
           } | awk 'NF && $0 ~ /^[0-9]+$/ && !seen[$0]++' | tee /tmp/to-label.txt
 
           if [ ! -s /tmp/to-label.txt ]; then
-            echo "No source PRs found for this trunk push"
+            echo "Draft matched but no source PR numbers parsed"
             exit 0
           fi
 
           while read -r n; do
-            state=$(gh pr view "$n" --json state,mergedAt --jq '[.state, (.mergedAt // "")] | @tsv')
-            pr_state=${state%%$'	'*}
-            if [[ "$pr_state" == "MERGED" ]]; then
+            state=$(gh pr view "$n" --repo "$GH_REPO" --json state --jq .state)
+            if [[ "$state" == "MERGED" ]]; then
               echo "Skipping #${n} (already merged in GitHub)"
               continue
             fi
-            echo "Adding ${LABEL} to #${n}"
-            gh pr edit "$n" --add-label "$LABEL"
+            echo "Adding ${LABEL} to #${n} (state=${state})"
+            gh pr edit "$n" --repo "$GH_REPO" --add-label "$LABEL"
           done < /tmp/to-label.txt
